@@ -11,6 +11,7 @@ is fetched from disk on demand and the index stays small.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -51,6 +52,11 @@ CREATE INDEX IF NOT EXISTS idx_imports_target ON imports(target);
 CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(file_path);
 """
 
+#: Bounds for a single search result set (defends against full-index dumps).
+_SEARCH_LIMIT_MIN = 1
+_SEARCH_LIMIT_MAX = 500
+_SEARCH_LIMIT_DEFAULT = 50
+
 
 @dataclass
 class SearchResult:
@@ -58,21 +64,47 @@ class SearchResult:
     id: int
 
 
+def _escape_like(query: str) -> str:
+    """Escape SQL LIKE metacharacters so a query can never act as a match-all.
+
+    Backslash is doubled first, then the `%` and `_` wildcards are escaped with
+    the backslash escape character (matching the `ESCAPE '\\'` clause used in
+    the query). A literal `%`/`_`/`\\` in the caller's query then matches only
+    that literal character instead of broadening the pattern.
+    """
+    return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _clamp_limit(limit) -> int:
+    """Coerce `limit` to a bounded int; non-integral/absent values fall back."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _SEARCH_LIMIT_DEFAULT
+    return max(_SEARCH_LIMIT_MIN, min(limit, _SEARCH_LIMIT_MAX))
+
+
 class Store:
     def __init__(self, db_path: str):
-        self._conn = sqlite3.connect(db_path)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.executescript(_SCHEMA)
+        # Tool handlers run on worker threads (the MCP SDK wraps sync tools in
+        # anyio.to_thread.run_sync), so the shared connection must be usable
+        # from any thread and every access serialized with a reentrant lock.
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = threading.RLock()
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.executescript(_SCHEMA)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # ---- indexing ----
 
     def replace_file(self, file_path: str, language: str, mtime: float, symbols: List[Symbol], imports: List[Import]) -> None:
         """Atomically replace a file's symbols + imports (idempotent re-index)."""
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO files(path, language, indexed_at, mtime) VALUES(?,?,?,?) "
                 "ON CONFLICT(path) DO UPDATE SET language=excluded.language, "
@@ -107,11 +139,12 @@ class Store:
             )
 
     def file_mtime(self, file_path: str) -> Optional[float]:
-        row = self._conn.execute("SELECT mtime FROM files WHERE path=?", (file_path,)).fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT mtime FROM files WHERE path=?", (file_path,)).fetchone()
         return row[0] if row else None
 
     def drop_file(self, file_path: str) -> None:
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute("DELETE FROM files WHERE path=?", (file_path,))
             self._conn.execute("DELETE FROM symbols WHERE file_path=?", (file_path,))
             self._conn.execute("DELETE FROM imports WHERE file_path=?", (file_path,))
@@ -123,12 +156,19 @@ class Store:
         query: str,
         kind: Optional[str] = None,
         language: Optional[str] = None,
-        limit: int = 50,
+        limit: int = _SEARCH_LIMIT_DEFAULT,
     ) -> List[SearchResult]:
-        """Substring match on name (and qualified name)."""
+        """Substring match on name (and qualified name).
+
+        LIKE metacharacters in the query are escaped and `limit` is clamped to
+        a bounded range so a single request can never dump the whole index.
+        """
+        query = _escape_like(str(query or ""))
+        limit = _clamp_limit(limit)
         like = f"%{query}%"
         sql = "SELECT id, name, kind, qualified_name, signature, start_byte, end_byte, " \
-              "start_line, end_line, file_path, language FROM symbols WHERE (name LIKE ? OR qualified_name LIKE ?)"
+              "start_line, end_line, file_path, language FROM symbols " \
+              "WHERE (name LIKE ? ESCAPE '\\' OR qualified_name LIKE ? ESCAPE '\\')"
         args: list = [like, like]
         if kind:
             sql += " AND kind=?"
@@ -138,7 +178,18 @@ class Store:
             args.append(language)
         sql += " ORDER BY name LIMIT ?"
         args.append(limit)
-        return [_to_result(r) for r in self._conn.execute(sql, args).fetchall()]
+        with self._lock:
+            return [_to_result(r) for r in self._conn.execute(sql, args).fetchall()]
+
+    def symbol_by_id(self, symbol_id: int) -> List[SearchResult]:
+        """Look up a single symbol by primary key (thread-safe)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, name, kind, qualified_name, signature, start_byte, end_byte, "
+                "start_line, end_line, file_path, language FROM symbols WHERE id=?",
+                (symbol_id,),
+            ).fetchone()
+        return [_to_result(row)] if row else []
 
     def exact_symbol(self, name: str, file_path: Optional[str] = None) -> List[SearchResult]:
         sql = "SELECT id, name, kind, qualified_name, signature, start_byte, end_byte, " \
@@ -148,36 +199,45 @@ class Store:
             sql += " AND file_path=?"
             args.append(file_path)
         sql += " ORDER BY file_path LIMIT 100"
-        return [_to_result(r) for r in self._conn.execute(sql, args).fetchall()]
+        with self._lock:
+            return [_to_result(r) for r in self._conn.execute(sql, args).fetchall()]
 
     def symbols_in_file(self, file_path: str) -> List[SearchResult]:
         sql = "SELECT id, name, kind, qualified_name, signature, start_byte, end_byte, " \
               "start_line, end_line, file_path, language FROM symbols WHERE file_path=? " \
               "ORDER BY start_line"
-        return [_to_result(r) for r in self._conn.execute(sql, (file_path,)).fetchall()]
+        with self._lock:
+            return [_to_result(r) for r in self._conn.execute(sql, (file_path,)).fetchall()]
 
     def importers_of(self, target: str) -> List[str]:
         """Files that import a target (exact or suffix match on the module path)."""
-        rows = self._conn.execute(
-            "SELECT DISTINCT file_path FROM imports WHERE target=? OR target LIKE ? OR target LIKE ?",
-            (target, f"%/{target}", f"%.{target}"),
-        ).fetchall()
+        raw = str(target or "")
+        escaped = _escape_like(raw)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT file_path FROM imports "
+                "WHERE target=? OR target LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\' "
+                "LIMIT ?",
+                (raw, f"%/{escaped}", f"%.{escaped}", _SEARCH_LIMIT_MAX),
+            ).fetchall()
         return [r[0] for r in rows]
 
     def imports_of(self, file_path: str) -> List[Tuple[str, int]]:
-        rows = self._conn.execute(
-            "SELECT target, line FROM imports WHERE file_path=? ORDER BY line",
-            (file_path,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT target, line FROM imports WHERE file_path=? ORDER BY line",
+                (file_path,),
+            ).fetchall()
         return [(r[0], r[1]) for r in rows]
 
     def stats(self) -> dict:
-        n_files = self._conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        n_symbols = self._conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-        n_imports = self._conn.execute("SELECT COUNT(*) FROM imports").fetchone()[0]
-        by_lang = self._conn.execute(
-            "SELECT language, COUNT(*) FROM symbols GROUP BY language ORDER BY COUNT(*) DESC"
-        ).fetchall()
+        with self._lock:
+            n_files = self._conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            n_symbols = self._conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+            n_imports = self._conn.execute("SELECT COUNT(*) FROM imports").fetchone()[0]
+            by_lang = self._conn.execute(
+                "SELECT language, COUNT(*) FROM symbols GROUP BY language ORDER BY COUNT(*) DESC"
+            ).fetchall()
         return {
             "files": n_files,
             "symbols": n_symbols,
@@ -186,7 +246,8 @@ class Store:
         }
 
     def indexed_files(self) -> List[str]:
-        rows = self._conn.execute("SELECT path FROM files ORDER BY path").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT path FROM files ORDER BY path").fetchall()
         return [r[0] for r in rows]
 
 

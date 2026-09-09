@@ -15,6 +15,7 @@ Tool surface (mirrors the jcodemunch value prop, built from scratch):
 
 from __future__ import annotations
 
+import hmac
 import os
 import sys
 from pathlib import Path
@@ -121,6 +122,15 @@ def search_symbols(
     to e.g. function/class/method; `language` to python/go/typescript/etc.
     """
     store = get_store()
+    try:
+        query = "" if query is None else str(query)
+    except Exception:
+        query = ""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 500))
     results = store.search_symbols(query, kind=kind, language=language, limit=limit)
     return {
         "count": len(results),
@@ -157,15 +167,7 @@ def get_symbol_source(symbol_id: Optional[int] = None, name: Optional[str] = Non
     store = get_store()
     results = []
     if symbol_id is not None:
-        # id path: look up by primary key directly
-        row = store._conn.execute(
-            "SELECT id, name, kind, qualified_name, signature, start_byte, end_byte, "
-            "start_line, end_line, file_path, language FROM symbols WHERE id=?",
-            (symbol_id,),
-        ).fetchone()
-        if row:
-            from .store import _to_result
-            results = [_to_result(row)]
+        results = store.symbol_by_id(symbol_id)
     elif name:
         results = store.exact_symbol(name, file_path=file)
 
@@ -252,6 +254,49 @@ def list_languages() -> dict:
     return {"languages": supported_languages()}
 
 
+class RequireBearerToken:
+    """ASGI gate requiring `Authorization: Bearer <token>` on every HTTP request.
+
+    Deliberately prevents exposing local source indexing over the network
+    without the operator-supplied shared secret. Constant-time comparison via
+    hmac.compare_digest avoids timing side channels on the token check.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.expected = b"Bearer " + token.encode("utf-8")
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        provided = b""
+        for name, value in scope.get("headers", []):
+            if name == b"authorization":
+                provided = value
+                break
+        if not hmac.compare_digest(provided, self.expected):
+            body = b'{"error":"unauthorized"}'
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
+
+
+async def _serve_http(app, host: str, port: int) -> None:
+    import uvicorn
+
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
 def main() -> None:
     """Entry point: run the server over stdio (or HTTP if SOURCELENS_HTTP is set)."""
     if os.environ.get("SOURCELENS_HTTP"):
@@ -259,7 +304,16 @@ def main() -> None:
 
         host = os.environ.get("SOURCELENS_HOST", "127.0.0.1")
         port = int(os.environ.get("SOURCELENS_PORT", "8766"))
-        asyncio.run(mcp.run_streamable_http_async(host=host, port=port))
+        token = os.environ.get("SOURCELENS_TOKEN", "")
+        if not token:
+            raise SystemExit(
+                "Refusing to serve over HTTP without authentication. "
+                "Set SOURCELENS_TOKEN to require a bearer token on every HTTP "
+                "request, or use the stdio transport for token-free local use."
+            )
+        app = mcp.streamable_http_app(host=host)
+        app = RequireBearerToken(app, token)
+        asyncio.run(_serve_http(app, host, port))
     else:
         mcp.run(transport="stdio")
 

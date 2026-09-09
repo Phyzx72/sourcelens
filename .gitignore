@@ -8,3 +8,5 @@ build/
 *.db
 *.db-wal
 *.db-shm
+strix_runs/
+neo_strix_report.txt
