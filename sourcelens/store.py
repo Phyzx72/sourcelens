@@ -10,6 +10,7 @@ is fetched from disk on demand and the index stays small.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -89,6 +90,8 @@ class Store:
         # Tool handlers run on worker threads (the MCP SDK wraps sync tools in
         # anyio.to_thread.run_sync), so the shared connection must be usable
         # from any thread and every access serialized with a reentrant lock.
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._lock = threading.RLock()
         with self._lock:
