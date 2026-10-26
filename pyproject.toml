@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Token-efficient local code retrieval MCP server — index a codebase once with tree-sitter, query exact symbols instead of re-reading files."
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "Newtonian" }]
+authors = [{ name = "Michael Mills" }]
 dependencies = [
     "mcp>=2.0",
     "tree-sitter>=0.26",
@@ -15,6 +15,9 @@ dependencies = [
     "tree-sitter-rust>=0.24",
     "tree-sitter-cpp>=0.23",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
 
 [project.scripts]
 sourcelens = "sourcelens.server:main"

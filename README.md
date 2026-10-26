@@ -11,7 +11,7 @@ Reading whole files to find one function is a token incinerator. `sourcelens` pa
 ## Install
 
 ```bash
-git clone <this-repo> sourcelens
+git clone https://github.com/Phyzx72/sourcelens.git
 cd sourcelens
 uv venv .venv && source .venv/bin/activate
 uv pip install -e .
@@ -63,6 +63,7 @@ Never `Read` a whole file to find one symbol again.
 ## Tests
 
 ```bash
+pip install -e '.[dev]'
 python -m pytest tests/ -v
 ```
 
